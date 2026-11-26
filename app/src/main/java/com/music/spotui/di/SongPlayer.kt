@@ -44,6 +44,18 @@ object SongPlayer {
     // Cache of resolved stream URLs keyed by the "title artist" query, so replays
     // and prefetched neighbours start instantly instead of re-hitting the network.
     private val streamCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+    // When each cached stream URL was resolved. Remote URLs (YouTube/Deezer/lossless CDN)
+    // are signed and expire, so a hit older than STREAM_TTL_MS is thrown away instead of
+    // being handed to ExoPlayer (that was the "can't load the stream" on old cached URLs).
+    private val streamCachedAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private const val STREAM_TTL_MS = 25L * 60 * 1000
+    // Search result (video ids) per song, so a retry / replay skips the slow
+    // Spotify-metadata + YouTube-search steps and goes straight to the player call.
+    private val videoIdCache = java.util.concurrent.ConcurrentHashMap<String, List<String>>()
+    private fun putStream(song: String, url: String) {
+        streamCache[song] = url
+        streamCachedAt[song] = System.currentTimeMillis()
+    }
     // Which engine each cached stream came from ("YouTube", "Lossless • …") so a
     // cache hit can restore the correct source badge.
     private val sourceCache = java.util.concurrent.ConcurrentHashMap<String, String>()
@@ -222,6 +234,7 @@ object SongPlayer {
 
     fun invalidateResolvedStream(song: String) {
         streamCache.remove(song)
+        streamCachedAt.remove(song)
         sourceCache.remove(song)
         qualityCache.remove(song)
     }
@@ -417,7 +430,7 @@ object SongPlayer {
             fast == null -> streamFailed(song, ctx)
             else -> {
                 // No lossless copy: remember the YouTube stream so a replay starts at once.
-                streamCache[song] = fast.streamUrl
+                putStream(song, fast.streamUrl)
                 sourceCache[song] = "YouTube"
                 qualityCache[song] = ytQualityLabel(fast)
             }
@@ -677,6 +690,11 @@ object SongPlayer {
             return android.net.Uri.fromFile(java.io.File(path)).toString()
         }
         streamCache[song]?.let { cachedUrl ->
+            val ageMs = System.currentTimeMillis() - (streamCachedAt[song] ?: 0L)
+            if (cachedUrl.startsWith("http") && ageMs > STREAM_TTL_MS) {
+                invalidateResolvedStream(song) // expired signed URL — resolve a fresh one
+                return@let
+            }
             // Source choices take effect immediately; never let a URL cached under the
             // previous choice silently keep using that provider.
             val cachedSource = sourceCache[song]
@@ -733,7 +751,7 @@ object SongPlayer {
                 if (r.mimeFlac || (!quality.lossless && !belowYouTube)) {
                     Log.d(TAG, "deezer ${r.qualityLabel} for: $song")
                     if (forPlayback) { currentSource = "Deezer"; currentQuality = r.qualityLabel }
-                    streamCache[song] = r.uri
+                    putStream(song, r.uri)
                     sourceCache[song] = "Deezer"
                     qualityCache[song] = r.qualityLabel
                     return r.uri
@@ -757,7 +775,7 @@ object SongPlayer {
                         currentSource = "Lossless • ${r.track.provider}"
                         currentQuality = flacQuality
                     }
-                    streamCache[song] = r.track.url
+                    putStream(song, r.track.url)
                     sourceCache[song] = "Lossless • ${r.track.provider}"
                     qualityCache[song] = flacQuality
                     return r.track.url
@@ -778,7 +796,7 @@ object SongPlayer {
                 }.getOrNull()
                 if (file != null) {
                     val url = android.net.Uri.fromFile(file).toString()
-                    streamCache[song] = url
+                    putStream(song, url)
                     sourceCache[song] = "Lossless • Soulseek"
                     qualityCache[song] = "FLAC"
                     return url
@@ -789,7 +807,7 @@ object SongPlayer {
         fun useHeldDeezer(r: com.music.spotui.deezer.DeezerSource.Result.Success): String {
             Log.d(TAG, "using Deezer MP3 fallback for: $song")
             if (forPlayback) { currentSource = "Deezer"; currentQuality = r.qualityLabel }
-            streamCache[song] = r.uri
+            putStream(song, r.uri)
             sourceCache[song] = "Deezer"
             qualityCache[song] = r.qualityLabel
             return r.uri
@@ -810,7 +828,7 @@ object SongPlayer {
             ?: return heldDeezer?.let(::useHeldDeezer)
         val ytQuality = ytQualityLabel(playback)
         if (forPlayback) currentQuality = ytQuality
-        streamCache[song] = playback.streamUrl
+        putStream(song, playback.streamUrl)
         sourceCache[song] = "YouTube"
         qualityCache[song] = ytQuality
         return playback.streamUrl
@@ -1262,7 +1280,9 @@ object SongPlayer {
             }
             return null
         }
-        tryIds(resolveVideoCandidates(query).take(3))?.let { return it }
+        val songIds = videoIdCache[query] ?: resolveVideoCandidates(query).take(3)
+            .also { if (it.isNotEmpty()) videoIdCache[query] = it }
+        tryIds(songIds)?.let { return it }
         if (!com.music.spotui.data.preferences.isVideoFallbackEnabled(appContext)) {
             Log.w(TAG, "song candidates exhausted and video fallback disabled for: ${searchTextForPlayback(query)}")
             return null
@@ -1396,13 +1416,16 @@ object SongPlayer {
             // that fails at the same spot again is dead, so skip instead of looping.
             val pos = player?.currentPosition ?: 0L
             val madeProgress = retriedRequest != song || pos > retriedAtMs + 10_000L
-            val isIoError = error.errorCode in 2000..2999 && madeProgress
+            // Network (2xxx) AND source/parsing (3xxx) errors usually mean a dead or
+            // expired URL — re-resolve once instead of giving up.
+            val isIoError = (error.errorCode in 2000..3999) && madeProgress
             retriedRequest = song
             retriedAtMs = pos
             scope.launch {
                 if (isIoError) {
-                    // Brief wait so a transient network blip has time to recover.
-                    delay(3_000L)
+                    // Brief wait only for real network blips; an expired URL (HTTP 403/410
+                    // etc.) won't recover by waiting, so retry immediately.
+                    delay(if (error.errorCode == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS) 0L else 3_000L)
                     // User may have manually skipped while we were waiting — bail if so.
                     if (currentRequest != song) return@launch
                     val fresh = resolveStreamUrl(song, ctx, forPlayback = true)
