@@ -64,6 +64,12 @@ class MyApplication : Application(){
             }
         }
 
+        // Warm the YouTube player.js (needed to decode stream URLs) in the background so
+        // the FIRST song tap doesn't pay the download/parse cost.
+        appScope.launch {
+            runCatching { com.metrolist.music.utils.cipher.PlayerJsFetcher.getPlayerJs() }
+        }
+
         // Warm the Home feed cache so the first navigation to Home is instant.
         // No-op (gracefully) until a Spotify token is available.
         val api = Api(this)
